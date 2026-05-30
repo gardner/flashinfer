@@ -2,20 +2,6 @@ name: Release CI Docker
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - 'docker/**'
-      - '.github/workflows/release-ci-docker.yml'
-      - 'requirements.txt'
-  pull_request:
-    branches:
-      - main
-    paths:
-      - 'docker/**'
-      - '.github/workflows/release-ci-docker.yml'
-      - 'requirements.txt'
 jobs:
   generate-tag:
     runs-on: ubuntu-latest

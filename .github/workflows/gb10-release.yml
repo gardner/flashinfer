@@ -1,0 +1,233 @@
+name: GB10 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: "GitHub release tag. Defaults to gb10-flashinfer-v<version>-<sha>."
+        required: false
+        type: string
+      cuda-version:
+        description: "CUDA toolkit version used by the manylinux builder image."
+        required: false
+        default: "13.0"
+        type: string
+      python-version:
+        description: "Python version for pure package wheels."
+        required: false
+        default: "3.12"
+        type: string
+      publish-release:
+        description: "Upload artifacts to a GitHub release."
+        required: false
+        default: true
+        type: boolean
+  push:
+    tags:
+      - "gb10-flashinfer-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gb10-flashinfer-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      cuda_version: ${{ steps.meta.outputs.cuda_version }}
+      cuda_suffix: ${{ steps.meta.outputs.cuda_suffix }}
+      python_version: ${{ steps.meta.outputs.python_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          INPUT_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs['release-tag'] || '' }}
+          INPUT_CUDA_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs['cuda-version'] || '13.0' }}
+          INPUT_PYTHON_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs['python-version'] || '3.12' }}
+        run: |
+          set -euo pipefail
+          release_tag="${INPUT_RELEASE_TAG}"
+          if [ -z "${release_tag}" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            release_tag="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "${release_tag}" ]; then
+            version="$(tr -d '[:space:]' < version.txt)"
+            release_tag="gb10-flashinfer-v${version}-$(git rev-parse --short HEAD)"
+          fi
+
+          cuda_suffix="cu$(echo "${INPUT_CUDA_VERSION}" | tr -d '.')"
+          echo "release_tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+          echo "cuda_version=${INPUT_CUDA_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "cuda_suffix=${cuda_suffix}" >> "${GITHUB_OUTPUT}"
+          echo "python_version=${INPUT_PYTHON_VERSION}" >> "${GITHUB_OUTPUT}"
+
+  build-python:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.setup.outputs.python_version }}
+
+      - name: Build flashinfer-python
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install build wheel
+          python -m build --wheel --sdist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flashinfer-python-dist
+          path: dist/*
+
+  build-cubin:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.setup.outputs.python_version }}
+
+      - name: Build flashinfer-cubin
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install build wheel
+          cd flashinfer-cubin
+          rm -rf dist build *.egg-info
+          python -m build --wheel
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flashinfer-cubin-wheel
+          path: flashinfer-cubin/dist/*.whl
+
+  build-jit-cache:
+    needs: setup
+    runs-on: [self-hosted, linux, arm64, cpu, on-demand]
+    timeout-minutes: 360
+    env:
+      FLASHINFER_CUDA_ARCH_LIST: "12.1a"
+      FLASHINFER_LOCAL_VERSION: ${{ needs.setup.outputs.cuda_suffix }}gb10
+      DOCKER_IMAGE: pytorch/manylinuxaarch64-builder:cuda${{ needs.setup.outputs.cuda_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build native SM121A JIT cache wheel
+        run: |
+          set -euo pipefail
+          cuda_major="$(echo "${{ needs.setup.outputs.cuda_version }}" | cut -d'.' -f1)"
+          cuda_minor="$(echo "${{ needs.setup.outputs.cuda_version }}" | cut -d'.' -f2)"
+          mkdir -p "${GITHUB_WORKSPACE}/ci-cache" "${GITHUB_WORKSPACE}/dist-jit-cache"
+
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -v "${GITHUB_WORKSPACE}/ci-cache:/ci-cache" \
+            -e FLASHINFER_CI_CACHE=/ci-cache \
+            -e CUDA_VERSION="${{ needs.setup.outputs.cuda_version }}" \
+            -e CUDA_MAJOR="${cuda_major}" \
+            -e CUDA_MINOR="${cuda_minor}" \
+            -e FLASHINFER_LOCAL_VERSION="${FLASHINFER_LOCAL_VERSION}" \
+            -e ARCH="aarch64" \
+            -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+            -e OUTPUT_DIR="/workspace/dist-jit-cache" \
+            -w /workspace \
+            "${DOCKER_IMAGE}" \
+            bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
+
+      - name: Verify CUDA images are SM121A only
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${DOCKER_IMAGE}" \
+            bash -lc 'python3 - <<"PY"
+          import re
+          import subprocess
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          allowed = {"sm_121a", "compute_121a", "sm_121", "compute_121"}
+          wheels = sorted(Path("dist-jit-cache").glob("*.whl"))
+          if not wheels:
+              raise SystemExit("No flashinfer-jit-cache wheels were built")
+
+          found = False
+          bad = set()
+          with tempfile.TemporaryDirectory() as tmp:
+              tmp_path = Path(tmp)
+              for wheel in wheels:
+                  with zipfile.ZipFile(wheel) as zf:
+                      zf.extractall(tmp_path / wheel.stem)
+                  for so in (tmp_path / wheel.stem).rglob("*.so"):
+                      proc = subprocess.run(
+                          ["cuobjdump", "--list-elf", str(so)],
+                          text=True,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT,
+                          check=False,
+                      )
+                      tokens = set(re.findall(r"\b(?:sm|compute)_[0-9]+[a-z]?\b", proc.stdout))
+                      if tokens:
+                          found = True
+                          bad.update(tokens - allowed)
+
+          if bad:
+              raise SystemExit(f"Unexpected CUDA images in GB10 wheel: {sorted(bad)}")
+          if not found:
+              raise SystemExit("No CUDA images found in flashinfer-jit-cache wheel")
+          print("Verified GB10 flashinfer-jit-cache CUDA images")
+          PY'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flashinfer-jit-cache-${{ needs.setup.outputs.cuda_suffix }}-aarch64-sm121a
+          path: dist-jit-cache/*.whl
+
+  publish:
+    needs: [setup, build-python, build-cubin, build-jit-cache]
+    if: github.event_name == 'push' || inputs['publish-release'] == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Upload artifacts to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name "*.whl" -o -name "*.tar.gz" \) -exec cp {} dist/ \;
+          test -n "$(find dist -type f -print -quit)"
+
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes "GB10 Spark FlashInfer release with native SM121A JIT cache wheels." \
+              --prerelease
+          fi
+          gh release upload "${RELEASE_TAG}" dist/* --clobber
