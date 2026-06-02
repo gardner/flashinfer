@@ -23,6 +23,8 @@ def test_gb10_release_workflow_builds_native_sm121a_jit_cache():
     assert 'FLASHINFER_CUBIN_EXCLUDE_TRTLLM_GEN_FMHA: "1"' in workflow
     assert 'FLASHINFER_CUDA_ARCH_LIST: "12.1a"' in workflow
     assert "manylinuxaarch64-builder:cuda" in workflow
+    assert "runs-on: ubuntu-24.04-arm" in workflow
+    assert "[self-hosted, linux, arm64, cpu, on-demand]" not in workflow
     assert "flashinfer-jit-cache" in workflow
     assert "cuobjdump" in workflow
     assert "SHA256SUMS" in workflow

@@ -127,7 +127,7 @@ jobs:
 
   build-jit-cache:
     needs: setup
-    runs-on: [self-hosted, linux, arm64, cpu, on-demand]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     env:
       FLASHINFER_CUDA_ARCH_LIST: "12.1a"
