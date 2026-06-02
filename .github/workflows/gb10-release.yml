@@ -40,6 +40,7 @@ jobs:
       release_tag: ${{ steps.meta.outputs.release_tag }}
       cuda_version: ${{ steps.meta.outputs.cuda_version }}
       cuda_suffix: ${{ steps.meta.outputs.cuda_suffix }}
+      local_version: ${{ steps.meta.outputs.local_version }}
       python_version: ${{ steps.meta.outputs.python_version }}
     steps:
       - uses: actions/checkout@v4
@@ -62,14 +63,18 @@ jobs:
           fi
 
           cuda_suffix="cu$(echo "${INPUT_CUDA_VERSION}" | tr -d '.')"
+          local_version="${cuda_suffix}gb10"
           echo "release_tag=${release_tag}" >> "${GITHUB_OUTPUT}"
           echo "cuda_version=${INPUT_CUDA_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "cuda_suffix=${cuda_suffix}" >> "${GITHUB_OUTPUT}"
+          echo "local_version=${local_version}" >> "${GITHUB_OUTPUT}"
           echo "python_version=${INPUT_PYTHON_VERSION}" >> "${GITHUB_OUTPUT}"
 
   build-python:
     needs: setup
     runs-on: ubuntu-latest
+    env:
+      FLASHINFER_LOCAL_VERSION: ${{ needs.setup.outputs.local_version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -94,6 +99,8 @@ jobs:
   build-cubin:
     needs: setup
     runs-on: ubuntu-latest
+    env:
+      FLASHINFER_LOCAL_VERSION: ${{ needs.setup.outputs.local_version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -123,7 +130,7 @@ jobs:
     timeout-minutes: 360
     env:
       FLASHINFER_CUDA_ARCH_LIST: "12.1a"
-      FLASHINFER_LOCAL_VERSION: ${{ needs.setup.outputs.cuda_suffix }}gb10
+      FLASHINFER_LOCAL_VERSION: ${{ needs.setup.outputs.local_version }}
       DOCKER_IMAGE: pytorch/manylinuxaarch64-builder:cuda${{ needs.setup.outputs.cuda_version }}
     steps:
       - uses: actions/checkout@v4
@@ -218,16 +225,73 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          CUDA_VERSION: ${{ needs.setup.outputs.cuda_version }}
+          CUDA_SUFFIX: ${{ needs.setup.outputs.cuda_suffix }}
+          LOCAL_VERSION: ${{ needs.setup.outputs.local_version }}
         run: |
           set -euo pipefail
           mkdir -p dist
           find artifacts -type f \( -name "*.whl" -o -name "*.tar.gz" \) -exec cp {} dist/ \;
           test -n "$(find dist -type f -print -quit)"
+          (cd dist && sha256sum * > SHA256SUMS)
+
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          dist = Path("dist")
+          asset_names = {"SHA256SUMS"}
+          assets = []
+          for path in sorted(dist.iterdir()):
+              if not path.is_file() or path.name in asset_names:
+                  continue
+              assets.append(
+                  {
+                      "name": path.name,
+                      "size": path.stat().st_size,
+                      "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  }
+              )
+
+          metadata = {
+              "release_tag": os.environ["RELEASE_TAG"],
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "commit": os.environ["GITHUB_SHA"],
+              "cuda_version": os.environ["CUDA_VERSION"],
+              "cuda_suffix": os.environ["CUDA_SUFFIX"],
+              "local_version": os.environ["LOCAL_VERSION"],
+              "cuda_arch": "sm_121a",
+              "artifacts": assets,
+          }
+          (dist / "release-metadata.json").write_text(
+              json.dumps(metadata, indent=2) + "\n"
+          )
+
+          notes = [
+              f"# {metadata['release_tag']}",
+              "",
+              "GB10 Spark FlashInfer prerelease with native SM121A JIT-cache artifacts.",
+              "",
+              f"- Commit: `{metadata['commit']}`",
+              f"- CUDA: `{metadata['cuda_version']}`",
+              f"- Local version suffix: `+{metadata['local_version']}`",
+              "- CUDA image target: `sm_121a`",
+              "",
+              "Assets:",
+          ]
+          notes.extend(
+              f"- `{asset['name']}` ({asset['sha256']})" for asset in assets
+          )
+          notes.append("")
+          (dist / "release-notes.md").write_text("\n".join(notes))
+          PY
 
           if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release create "${RELEASE_TAG}" \
               --title "${RELEASE_TAG}" \
-              --notes "GB10 Spark FlashInfer release with native SM121A JIT cache wheels." \
+              --notes-file dist/release-notes.md \
               --prerelease
           fi
           gh release upload "${RELEASE_TAG}" dist/* --clobber
