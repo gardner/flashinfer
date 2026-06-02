@@ -3890,6 +3890,7 @@ def mm_fp8(
             )
 
     if backend == "trtllm_low_latency":
+        _check_trtllm_low_latency_gemm_supported(a.device)
         trtllm_low_latency_gemm(a, b, alpha, out)
     else:
         raise ValueError(
@@ -3897,6 +3898,18 @@ def mm_fp8(
             f"Only {supported_backends} are supported for FP8 GEMM operations."
         )
     return out
+
+
+def _check_trtllm_low_latency_gemm_supported(device: torch.device) -> None:
+    major, minor = get_compute_capability(device)
+    if major != 10:
+        capability = major * 10 + minor
+        raise NotImplementedError(
+            "mm_fp8 with the trtllm_low_latency backend is only supported on "
+            f"SM100/SM103 GPUs; got compute capability {capability}. "
+            "Use bmm_fp8 or the CUTLASS groupwise/blockscaled FP8 GEMM APIs on "
+            "SM120/SM121."
+        )
 
 
 def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
@@ -5221,7 +5234,8 @@ def _b12x_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    # b12x backend requires CUDA 13+, 128x4 scale factor layout, and NVFP4 only.
+    # b12x backend requires CUDA 13+, 128x4 scale factor layout, NVFP4 only,
+    # and BF16 output. The FP16-output path currently fails accuracy on SM121.
     if get_cuda_version().major < 13:
         raise ValueError(
             "b12x FP4 GEMM requires CUDA 13 or later. "
@@ -5231,6 +5245,8 @@ def _b12x_gemm_fp4_requirement(
         raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
     if not use_nvfp4:
         raise ValueError("b12x FP4 GEMM only supports NVFP4 (sf_vec_size=16).")
+    if out_dtype is not torch.bfloat16:
+        raise ValueError("b12x FP4 GEMM only supports torch.bfloat16 output today.")
     _check_cute_dsl_availability()
     return True
 
@@ -5750,10 +5766,11 @@ def _heuristic_func_mm_fp4(
     # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
     major, minor = get_compute_capability(a.device)
     is_sm103 = major == 10 and minor == 3
-    is_sm120 = major == 12 and minor == 0
+    is_sm12x = major == 12
 
-    # SM120 + CUDA 13: prefer b12x (warp-level MMA, underfill tile selection)
-    if is_sm120 and use_nvfp4 and cuda_major >= 13:
+    # SM12x + CUDA 13: prefer b12x (warp-level MMA, underfill tile selection)
+    # for the validated BF16-output path. FP16 output falls through to CUTLASS.
+    if is_sm12x and use_nvfp4 and out_dtype is torch.bfloat16 and cuda_major >= 13:
         return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
     # If cuda version is 13 or greater and cudnn version is 9.15 or greater:
@@ -5928,7 +5945,7 @@ def mm_fp4(
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"]
-        Backend to use, defaults to ``"auto"``. On SM120, ``"auto"`` prefers
+        Backend to use, defaults to ``"auto"``. On SM12x, ``"auto"`` prefers
         ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. On other
         architectures, ``"auto"`` selects between ``"cudnn"`` and ``"cutlass"``
         based on the current CUDA and cuDNN versions. The ``"trtllm"`` and

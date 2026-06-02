@@ -19,7 +19,9 @@ def _test_mm_fp4(
 
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
-    if not mm_fp4.is_backend_supported(backend, compute_capability_number):
+    if backend != "auto" and not mm_fp4.is_backend_supported(
+        backend, compute_capability_number
+    ):
         pytest.skip(
             f"Skipping test for {backend} because it is not supported on compute capability {compute_capability_number}."
         )
@@ -41,6 +43,8 @@ def _test_mm_fp4(
             pytest.skip("b12x backend only supports SM120/SM121 GPUs.")
         if not use_nvfp4:
             pytest.skip("b12x backend only supports NVFP4 (sf_vec_size=16).")
+        if res_dtype is torch.float16:
+            pytest.skip("b12x backend only supports BF16 output today.")
         if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
             pytest.skip("b12x backend requires CUDA 13+.")
     if not use_128x4_sf_layout and backend != "trtllm":
@@ -106,6 +110,163 @@ def _test_mm_fp4(
             pytest.xfail(str(e))
         else:
             pytest.fail(str(e))
+
+
+def _skip_unless_sm12x_cuda13():
+    if not torch.cuda.is_available():
+        pytest.skip("SM12x FP4 GEMM sweep requires CUDA")
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 12:
+        pytest.skip("SM12x FP4 GEMM sweep requires an SM120/SM121 GPU")
+    if not torch.version.cuda or int(torch.version.cuda.split(".")[0]) < 13:
+        pytest.skip("SM12x FP4 GEMM sweep requires CUDA 13+")
+
+
+@pytest.mark.parametrize("backend", ["b12x", "auto"])
+def test_mm_fp4_b12x_sm12x_m_sweep_no_m_dependent_zero_outputs(backend):
+    _skip_unless_sm12x_cuda13()
+
+    for m in [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        384,
+        512,
+        768,
+        1024,
+        1280,
+        1536,
+        2048,
+        3072,
+        4096,
+    ]:
+        _test_mm_fp4(
+            m,
+            128,
+            128,
+            torch.bfloat16,
+            backend,
+            True,
+            False,
+            "nvfp4",
+        )
+        torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("backend", ["b12x", "auto"])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 2048, 2048),
+        (16, 4096, 2048),
+        (64, 2048, 4096),
+        (128, 7168, 2048),
+    ],
+)
+def test_mm_fp4_b12x_sm12x_model_shape_smoke(backend, m, n, k):
+    _skip_unless_sm12x_cuda13()
+
+    _test_mm_fp4(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        backend,
+        True,
+        False,
+        "nvfp4",
+    )
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("backend", ["b12x", "auto"])
+def test_mm_fp4_b12x_sm12x_cuda_graph_replay(backend):
+    _skip_unless_sm12x_cuda13()
+
+    m, n, k = 16, 2048, 2048
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    mat2 = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    global_sf_input = (448 * 6) / input.float().abs().nan_to_num().max()
+    global_sf_mat2 = (448 * 6) / mat2.float().abs().nan_to_num().max()
+    input_fp4, input_inv_s = nvfp4_quantize(
+        input,
+        global_sf_input,
+        sfLayout=SfLayout.layout_128x4,
+        do_shuffle=False,
+    )
+    mat2_fp4, mat2_inv_s = nvfp4_quantize(
+        mat2,
+        global_sf_mat2,
+        sfLayout=SfLayout.layout_128x4,
+        do_shuffle=False,
+    )
+    alpha = 1.0 / (global_sf_input * global_sf_mat2)
+    eager = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    replay = torch.empty_like(eager)
+
+    with autotune(False):
+        mm_fp4(
+            input_fp4,
+            mat2_fp4.T,
+            input_inv_s,
+            mat2_inv_s.T,
+            alpha,
+            torch.bfloat16,
+            eager,
+            block_size=16,
+            backend=backend,
+            use_nvfp4=True,
+            skip_check=False,
+        )
+    torch.cuda.synchronize()
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            with autotune(False):
+                mm_fp4(
+                    input_fp4,
+                    mat2_fp4.T,
+                    input_inv_s,
+                    mat2_inv_s.T,
+                    alpha,
+                    torch.bfloat16,
+                    replay,
+                    block_size=16,
+                    backend=backend,
+                    use_nvfp4=True,
+                    skip_check=False,
+                )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph), autotune(False):
+        mm_fp4(
+            input_fp4,
+            mat2_fp4.T,
+            input_inv_s,
+            mat2_inv_s.T,
+            alpha,
+            torch.bfloat16,
+            replay,
+            block_size=16,
+            backend=backend,
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(replay, eager, rtol=1e-2, atol=1e-2)
 
 
 # TODO: Consdier splitting this function up for the various backends

@@ -81,6 +81,16 @@ constexpr uint32_t get_num_warps_kv(const uint32_t cta_tile_kv) {
   return 4 / get_num_warps_q(cta_tile_kv);
 }
 
+constexpr uint32_t get_num_warps_kv(const uint32_t cta_tile_q, const uint32_t head_dim_qk,
+                                    const uint32_t head_dim_vo) {
+  // A 4-KV-warp tile cannot fit Q/K=512 with V/O=256 in ~100 KiB SM12x shared
+  // memory. Use a smaller KV tile for the correctness-first split-V path.
+  if (cta_tile_q <= 16 && head_dim_qk >= 512 && head_dim_vo <= 256) {
+    return 2;
+  }
+  return get_num_warps_kv(cta_tile_q);
+}
+
 constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
   if (cta_tile_q > 64) {
     return 2;
@@ -1904,7 +1914,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
     constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
-    constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
+    constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO);
     constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
 
     using DTypeQKAccum =
@@ -2797,7 +2807,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   const uint32_t num_kv_heads = params.num_kv_heads;
   constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
+  constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO);
 
   if (padded_batch_size == 0) {
     // No request, skip
@@ -2922,7 +2932,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
   constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
+  constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO);
 
   if (padded_batch_size == 0) {
     // No request, skip

@@ -210,6 +210,15 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
     )
 
 
+def _canonicalize_fp4_quantization_backend(backend: str) -> str:
+    # SM120 can use the forward-compatible SM12x family target on CUDA >= 12.9.
+    # Keep SM121 arch-specific so Spark JIT/AOT users get sm_121a code instead
+    # of needlessly falling back to fp4_quantization_120f.
+    if backend == "120" and is_cuda_version_at_least("12.9"):
+        return "120f"
+    return backend
+
+
 @functools.cache
 def get_fp4_quantization_module(backend: str = "100"):
     backend_modules = {
@@ -222,15 +231,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         "90": gen_fp4_quantization_sm90_module,
     }
 
-    # Prefer 'f' (family / feature-set) variant for SM12x when CUDA >= 12.9,
-    # as it enables native FP4 conversion instructions (cvt.rn.satfinite.e2m1x2.f32).
-    # sm_120f covers the entire SM12x family (both SM120 and SM121).
-    # See: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
-    if backend in ("120", "121"):
-        from ..utils import version_at_least
-
-        if version_at_least(torch.version.cuda, "12.9"):
-            backend = "120f"
+    backend = _canonicalize_fp4_quantization_backend(backend)
 
     if backend not in backend_modules:
         raise ValueError(f"Invalid backend: {backend}")

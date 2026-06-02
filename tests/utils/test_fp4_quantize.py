@@ -1050,6 +1050,88 @@ def test_nvfp4_quantize_roundtrip(
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_sm12x_nan_padded_storage_cuda_graph(
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    """NaNs in storage padding must not affect active NVFP4 rows during graph replay."""
+    device_obj = torch.device(device)
+    if not _is_fp4_supported(device_obj):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if torch.cuda.get_device_capability(device_obj)[0] != 12:
+        pytest.skip("SM12x padding/graph regression requires an SM120/SM121 GPU")
+
+    torch.set_default_device(device)
+    torch.manual_seed(2026)
+
+    active_rows = 3
+    padded_rows = 128
+    cols = 1024
+    storage = torch.empty((padded_rows, cols), dtype=dtype, device=device)
+    storage[:active_rows].normal_()
+    storage[active_rows:].fill_(float("nan"))
+    x = storage[:active_rows]
+    assert x.is_contiguous()
+
+    clean_x = x.clone()
+    tensor_amax = torch.abs(clean_x).max().to(torch.float32)
+    global_scale = nvfp4_global_encode_scale_te(tensor_amax)
+    dequant_global_scale = nvfp4_global_decode_scale_te(tensor_amax)
+
+    expected_q, expected_sf = nvfp4_quantize(
+        clean_x,
+        global_scale,
+        sfLayout=SfLayout.layout_128x4,
+        backend="cuda",
+    )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            nvfp4_quantize(
+                x,
+                global_scale,
+                sfLayout=SfLayout.layout_128x4,
+                backend="cuda",
+            )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_q, graph_sf = nvfp4_quantize(
+            x,
+            global_scale,
+            sfLayout=SfLayout.layout_128x4,
+            backend="cuda",
+        )
+
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(
+        unswizzle_sf(graph_sf, active_rows, cols),
+        unswizzle_sf(expected_sf, active_rows, cols),
+        rtol=0,
+        atol=0,
+    )
+
+    dq_out = e2m1_and_ufp8sf_scale_to_float(
+        graph_q,
+        graph_sf,
+        dequant_global_scale,
+        sf_vec_size=16,
+        ufp8_type=1,
+        is_sf_swizzled_layout=True,
+    ).to(device)
+    assert torch.isfinite(dq_out).all()
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
 @pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)

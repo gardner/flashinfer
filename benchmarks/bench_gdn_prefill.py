@@ -23,6 +23,7 @@ Qwen3.5 family model configurations.
 Usage:
   python bench_gdn_prefill.py
   python bench_gdn_prefill.py --warmup 10 --iters 100
+  python bench_gdn_prefill.py --fi-only --max-cases 4
 """
 
 import argparse
@@ -149,6 +150,17 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark GDN Prefill Kernel")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--fi-only",
+        action="store_true",
+        help="Benchmark FlashInfer only and skip the optional FLA baseline.",
+    )
+    parser.add_argument(
+        "--max-cases",
+        type=int,
+        default=None,
+        help="Limit the number of model/sequence cases, useful for smoke tests.",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -157,39 +169,55 @@ def main():
         print(f"GDN requires SM90+, got SM{major}{minor}")
         sys.exit(1)
 
-    arch_label = {9: "Hopper (SM90)", 10: "Blackwell (SM100)"}.get(
+    arch_label = {9: "Hopper (SM90)", 10: "Blackwell (SM100)", 12: "GB10 (SM12x)"}.get(
         major, f"SM{major}{minor}"
     )
 
-    if not _has_fla:
-        print("Error: FLA not installed. Run: pip install flash-linear-attention")
-        sys.exit(1)
+    compare_fla = _has_fla and not args.fi_only
+    if not _has_fla and not args.fi_only:
+        print("FLA not installed; running FlashInfer-only benchmark.")
 
     print(f"\nGPU: {torch.cuda.get_device_name(0)} [{arch_label}]")
     print("Models: Qwen3.5 family (397B, 122B, 35B, 27B, 9B, 4B, 2B, 0.8B), d=128")
     print()
     fi_col = f"FI {arch_label}"
-    header = (
-        f"{'Heads':<15s}  {'Seqlens':<16s}  {'h_qk':>4s} {'h_v':>4s}"
-        f"  {fi_col:>22s}  {'TFLOPS':>7s}"
-        f"  {'FLA/Triton':>10s}  {'Speedup':>8s}"
-    )
+    if compare_fla:
+        header = (
+            f"{'Heads':<15s}  {'Seqlens':<16s}  {'h_qk':>4s} {'h_v':>4s}"
+            f"  {fi_col:>22s}  {'TFLOPS':>7s}"
+            f"  {'FLA/Triton':>10s}  {'Speedup':>8s}"
+        )
+    else:
+        header = (
+            f"{'Heads':<15s}  {'Seqlens':<16s}  {'h_qk':>4s} {'h_v':>4s}"
+            f"  {fi_col:>22s}  {'TFLOPS':>7s}"
+        )
     print(header)
     print("-" * len(header))
 
+    case_count = 0
     for h_qk, h_v, d, h_label in HEAD_CONFIGS:
         for endpoints, s_label in SEQ_CONFIGS:
             T = endpoints[-1]
             fi_ms = bench_fi(endpoints, h_qk, h_v, d, args.warmup, args.iters)
-            fla_ms = bench_fla(endpoints, h_qk, h_v, d, args.warmup, args.iters)
             tflops = _gdn_tflops(T, h_v, d, fi_ms)
-            speedup = fla_ms / fi_ms
-            marker = "+" if speedup > 1.0 else "-"
-            print(
-                f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
-                f"  {fi_ms:>21.3f}ms  {tflops:>6.1f}"
-                f"  {fla_ms:>9.3f}ms  {speedup:>7.2f}x {marker}"
-            )
+            if compare_fla:
+                fla_ms = bench_fla(endpoints, h_qk, h_v, d, args.warmup, args.iters)
+                speedup = fla_ms / fi_ms
+                marker = "+" if speedup > 1.0 else "-"
+                print(
+                    f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
+                    f"  {fi_ms:>21.3f}ms  {tflops:>6.1f}"
+                    f"  {fla_ms:>9.3f}ms  {speedup:>7.2f}x {marker}"
+                )
+            else:
+                print(
+                    f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
+                    f"  {fi_ms:>21.3f}ms  {tflops:>6.1f}"
+                )
+            case_count += 1
+            if args.max_cases is not None and case_count >= args.max_cases:
+                return
         print()
 
 

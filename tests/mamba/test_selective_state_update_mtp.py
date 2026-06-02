@@ -10,11 +10,18 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.utils import is_cvt_rs_supported, is_sm100a_supported
+from flashinfer.utils import (
+    is_cvt_rs_supported,
+    is_sm100a_supported,
+    is_sm12x_supported,
+)
 
-_requires_sm100 = pytest.mark.skipif(
-    not is_sm100a_supported(torch.device("cuda")),
-    reason="Vertical/horizontal MTP kernel requires SM100+ (Blackwell)",
+_requires_blackwell = pytest.mark.skipif(
+    not (
+        is_sm100a_supported(torch.device("cuda"))
+        or is_sm12x_supported(torch.device("cuda"))
+    ),
+    reason="Vertical/horizontal MTP kernel requires Blackwell",
 )
 
 from .triton_reference.selective_state_update import selective_state_update_triton
@@ -57,8 +64,8 @@ class TestSelectiveStateUpdateMTP:
         autouse=True,
         params=[
             "simple",
-            pytest.param("vertical", marks=_requires_sm100),
-            pytest.param("horizontal", marks=_requires_sm100),
+            pytest.param("vertical", marks=_requires_blackwell),
+            pytest.param("horizontal", marks=_requires_blackwell),
         ],
     )
     def _algorithm(self, request):

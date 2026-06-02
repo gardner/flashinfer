@@ -30,7 +30,12 @@ from .utils import (
     get_compute_capability,
     _get_cache_buf,
 )
-from .gdn_kernels import chunk_gated_delta_rule_sm100, _has_blackwell_prefill
+from .gdn_kernels import (
+    chunk_gated_delta_rule_sm100,
+    chunk_gated_delta_rule_sm12x,
+    _has_blackwell_prefill,
+    _has_sm12x_prefill,
+)
 
 
 @functools.cache
@@ -274,16 +279,24 @@ def chunk_gated_delta_rule(
     _scale = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(head_size)
 
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    _is_sm100a = get_compute_capability(device)[0] == 10
-    if _is_sm100a:
+    sm_major, sm_minor = get_compute_capability(device)
+    _is_sm10x = sm_major == 10
+    _is_sm12x = sm_major == 12
+    if _is_sm10x or _is_sm12x:
         if _cuda_major < 13:
             raise NotImplementedError(
                 "Blackwell GDN prefill is only supported on CUDA 13+"
             )
-        if not _has_blackwell_prefill:
+        if _is_sm10x and not _has_blackwell_prefill:
             raise NotImplementedError("Blackwell GDN prefill kernel is unavailable")
+        if _is_sm12x and not _has_sm12x_prefill:
+            raise NotImplementedError(
+                "SM12x GDN prefill kernel is unavailable. GB10/SM121 requires "
+                "a native SM12x implementation; refusing to route to the SM100 "
+                "tcgen05/TMEM kernel."
+            )
 
-        # Blackwell SM100 and SM103 path (CuTe DSL kernel)
+        # Blackwell SM100/SM103 and SM12x paths require Qwen-style head_size=128.
         assert head_size == 128, (
             f"Blackwell GDN prefill requires head_size=128, got {head_size}"
         )
@@ -318,22 +331,47 @@ def chunk_gated_delta_rule(
         if checkpoint_every_n_tokens > 0 and checkpoint_cu_starts is not None:
             _cu_checkpoints = checkpoint_cu_starts.to(torch.int32)
 
-        chunk_gated_delta_rule_sm100(
-            q,
-            k,
-            v,
-            _g,
-            _beta,
-            output,
-            cu_seqlens.to(torch.int32),
-            initial_state,
-            output_state,
-            _scale,
-            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            cu_checkpoints=_cu_checkpoints,
-            output_checkpoints=state_checkpoints,
-        )
+        if _is_sm10x:
+            assert chunk_gated_delta_rule_sm100 is not None
+            chunk_gated_delta_rule_sm100(
+                q,
+                k,
+                v,
+                _g,
+                _beta,
+                output,
+                cu_seqlens.to(torch.int32),
+                initial_state,
+                output_state,
+                _scale,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                cu_checkpoints=_cu_checkpoints,
+                output_checkpoints=state_checkpoints,
+            )
+        else:
+            assert chunk_gated_delta_rule_sm12x is not None
+            chunk_gated_delta_rule_sm12x(
+                q,
+                k,
+                v,
+                _g,
+                _beta,
+                output,
+                cu_seqlens.to(torch.int32),
+                initial_state,
+                output_state,
+                _scale,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                cu_checkpoints=_cu_checkpoints,
+                output_checkpoints=state_checkpoints,
+            )
     else:
+        if sm_major != 9:
+            raise NotImplementedError(
+                "GDN prefill is only supported on SM90 and SM100/SM103 today; "
+                f"got SM{sm_major}{sm_minor}. Refusing to load the SM90-only "
+                "fallback on an incompatible architecture."
+            )
         # SM90 Hopper path (C++ JIT kernel)
         if output_state is None:
             output_state = torch.empty(

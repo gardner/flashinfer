@@ -193,6 +193,137 @@ def test_batch_decode_tensor_cores(
     torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
 
 
+def _reference_decode_gqa_nhd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> torch.Tensor:
+    group_size = q.size(0) // k.size(1)
+    kv_head_for_q = torch.arange(q.size(0), device=q.device) // group_size
+    k_for_q = k.float()[:, kv_head_for_q, :]
+    v_for_q = v.float()[:, kv_head_for_q, :]
+    scores = torch.einsum("hd,lhd->hl", q.float(), k_for_q) * (q.size(-1) ** -0.5)
+    probs = torch.softmax(scores, dim=-1)
+    return torch.einsum("hl,lhd->hd", probs, v_for_q).to(q.dtype)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
+    reason="SM12x high-GQA decode regression requires an SM120/SM121 GPU",
+)
+@pytest.mark.skip(
+    reason=(
+        "SM12x high-GQA tensor-core decode currently hangs on GB10; keep this "
+        "as a manual blocker until the decode path is fixed."
+    )
+)
+@pytest.mark.parametrize(
+    "num_kv_heads,group_size,head_dim",
+    [
+        (1, 16, 128),
+        (1, 32, 128),
+        (2, 16, 256),
+    ],
+)
+def test_sm12x_high_gqa_batch_decode_tensor_cores(
+    num_kv_heads: int,
+    group_size: int,
+    head_dim: int,
+):
+    torch.manual_seed(2026)
+    batch_size = 2
+    kv_len = 33
+    page_size = 16
+    num_qo_heads = num_kv_heads * group_size
+    q = (
+        torch.randn(
+            batch_size,
+            num_qo_heads,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float16,
+        )
+        / 10
+    )
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_data = (
+        torch.randn(
+            total_num_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float16,
+        )
+        / 10
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,),
+        (kv_len - 1) % page_size + 1,
+        dtype=torch.int32,
+        device="cuda:0",
+    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer,
+        "NHD",
+        use_tensor_cores=True,
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    output = wrapper.run(q, kv_data)
+    torch.cuda.synchronize()
+
+    for batch_idx in range(batch_size):
+        page_start = batch_idx * num_pages_per_seq
+        page_stop = page_start + num_pages_per_seq
+        full_pages = kv_data[page_start : page_stop - 1]
+        last_page = kv_data[page_stop - 1]
+        last_len = int(kv_last_page_len[batch_idx].item())
+        k = torch.cat(
+            [
+                full_pages[:, 0].reshape(-1, num_kv_heads, head_dim),
+                last_page[0, :last_len].reshape(
+                    -1,
+                    num_kv_heads,
+                    head_dim,
+                ),
+            ],
+            dim=0,
+        )
+        v = torch.cat(
+            [
+                full_pages[:, 1].reshape(-1, num_kv_heads, head_dim),
+                last_page[1, :last_len].reshape(
+                    -1,
+                    num_kv_heads,
+                    head_dim,
+                ),
+            ],
+            dim=0,
+        )
+        ref = _reference_decode_gqa_nhd(q[batch_idx], k, v)
+        torch.testing.assert_close(output[batch_idx], ref, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("batch_size", [12, 17])
 @pytest.mark.parametrize("kv_len", [54, 97, 512])
 @pytest.mark.parametrize("page_size", [1, 8, 16])

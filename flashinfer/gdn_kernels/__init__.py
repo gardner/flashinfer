@@ -63,6 +63,12 @@ except (ImportError, RuntimeError):
     _has_blackwell_prefill = False
     chunk_gated_delta_rule_sm100 = None  # type: ignore
 
+try:
+    from .blackwell_sm12x import chunk_gated_delta_rule_sm12x, _has_sm12x_prefill
+except (ImportError, RuntimeError):
+    _has_sm12x_prefill = False
+    chunk_gated_delta_rule_sm12x = None  # type: ignore
+
 __all__ = [
     "gated_delta_rule",
     "gated_delta_rule_mtp",
@@ -75,5 +81,7 @@ __all__ = [
     "get_vec_size_mtp",
     "get_mtp_config",
     "chunk_gated_delta_rule_sm100",
+    "chunk_gated_delta_rule_sm12x",
     "_has_blackwell_prefill",
+    "_has_sm12x_prefill",
 ]

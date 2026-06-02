@@ -1678,6 +1678,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        self._fa2_vsplit_head_dim = None
+        self._fa2_vsplit_out_buf = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1880,6 +1882,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+        self._fa2_vsplit_head_dim = None
+        self._fa2_vsplit_out_buf = None
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -2024,13 +2028,36 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     kv_data_type,
                 )
             if self._backend != "cudnn":
+                module_head_dim_vo = head_dim_vo
+                if (
+                    self._backend == "fa2"
+                    and self._jit_module is None
+                    and is_sm12x_supported(self.device)
+                    and head_dim_qk == 512
+                    and head_dim_vo == 512
+                    and q_data_type in (torch.float16, torch.bfloat16)
+                    and kv_data_type in (torch.float16, torch.bfloat16)
+                    and o_data_type in (torch.float16, torch.bfloat16)
+                ):
+                    self._fa2_vsplit_head_dim = 256
+                    self._fa2_vsplit_out_buf = torch.empty(
+                        (
+                            self._max_total_num_rows or total_num_rows,
+                            num_qo_heads,
+                            self._fa2_vsplit_head_dim,
+                        ),
+                        dtype=o_data_type,
+                        device=self.device,
+                    )
+                    module_head_dim_vo = self._fa2_vsplit_head_dim
+
                 get_module_args = (
                     q_data_type,
                     kv_data_type,
                     o_data_type,
                     paged_kv_indptr.dtype,
                     head_dim_qk,
-                    head_dim_vo,
+                    module_head_dim_vo,
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left >= 0,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
@@ -2089,7 +2116,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 page_size,
                 self.is_cuda_graph_enabled,
                 head_dim_qk,
-                head_dim_vo,
+                self._fa2_vsplit_head_dim or head_dim_vo,
                 causal,
                 window_left,
             ]
@@ -2382,6 +2409,87 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         if self._prefix_len_ptr is not None:
             mask_mode = MaskMode.MULTIITEMSCORING.value
+
+        if self._fa2_vsplit_head_dim is not None:
+            assert self._backend == "fa2"
+            assert self._cached_module is not None, "cached module is not initialized"
+            assert self._plan_info is not None, "plan info is not initialized"
+            assert self._fa2_vsplit_out_buf is not None
+            split_dim = self._fa2_vsplit_head_dim
+            if out_head_dim % split_dim != 0:
+                raise RuntimeError(
+                    f"Internal error: cannot split output head dim {out_head_dim} into {split_dim}"
+                )
+            fp8_scale_q = None
+            fp8_scale_k = None
+            fp8_scale_v = None
+            if is_float8(q) and len(args) >= 3:
+                fp8_scale_q = args[0]
+                fp8_scale_k = args[1]
+                fp8_scale_v = args[2]
+
+            chunk_rows = q.shape[0]
+            for begin in range(0, out_head_dim, split_dim):
+                end = begin + split_dim
+                v_chunk = v_cache[..., begin:end]
+                chunk_out = self._fa2_vsplit_out_buf[:chunk_rows]
+                chunk_lse = lse if begin == 0 else None
+                run_args = [
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._plan_info,
+                    q,
+                    k_cache,
+                    v_chunk,
+                    self._qo_indptr_buf,
+                    self._paged_kv_indptr_buf,
+                    self._paged_kv_indices_buf,
+                    self._paged_kv_last_page_len_buf,
+                    chunk_out,
+                    chunk_lse,
+                    mask_mode,
+                    TensorLayout[self._kv_layout].value,
+                    window_left,
+                    enable_pdl,
+                    self._custom_mask_buf,
+                    self._mask_indptr_buf,
+                    _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                    self._prefix_len_ptr,
+                    self._token_pos_in_items_ptr,
+                    self._max_item_len_ptr,
+                    logits_soft_cap,
+                    sm_scale,
+                    fp8_scale_q,
+                    fp8_scale_k,
+                    fp8_scale_v,
+                    rope_scale,
+                    rope_theta,
+                    self._token_pos_in_items_len,
+                    self._workspace_size,
+                    self._num_qo_heads,
+                    self._num_kv_heads,
+                    self._block_tables,
+                    self._kv_lens_buffer,
+                    page_size,
+                    self._max_q_len,
+                    self._max_kv_len,
+                    self._batch_size,
+                    self._qo_indptr_buf,
+                    self._paged_kv_indptr_buf,
+                    sinks,
+                    key_block_scales,
+                    value_block_scales,
+                    skip_softmax_threshold_scale_factor,
+                    True,  # uses_shared_paged_kv_idx
+                ]
+                self._cached_module.paged_run(*run_args)
+                out[..., begin:end].copy_(chunk_out)
+
+            is_float_one = isinstance(v_scale, float) and v_scale == 1.0
+            if v_scale is not None and not is_float_one:
+                out *= v_scale
+
+            return (out, lse) if return_lse else out
 
         if self._backend == "cudnn":
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:

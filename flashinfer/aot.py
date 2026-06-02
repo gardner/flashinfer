@@ -87,6 +87,7 @@ from .jit.gemm import (
 )
 from .jit.mamba import (
     gen_selective_state_update_module,
+    gen_selective_state_update_sm100_module,
     gen_selective_state_update_sm90_module,
 )
 from .jit.mhc import gen_mhc_module
@@ -328,8 +329,9 @@ def gen_attention(
     if add_oai_oss:
         from .jit.attention import gen_batch_prefill_attention_sink_module
 
+        attention_sink_backend_ = ["fa2"] + (["fa3"] if has_sm90 else [])
         for dtype in f16_dtype_:
-            for backend in ["fa2", "fa3"]:
+            for backend in attention_sink_backend_:
                 for use_swa in [True, False]:
                     yield gen_batch_prefill_attention_sink_module(
                         backend=backend,
@@ -473,6 +475,7 @@ def gen_all_modules(
     has_sm120 = sm_capabilities.get("sm120", False)
     has_sm120f = sm_capabilities.get("sm120f", False)
     has_sm121 = sm_capabilities.get("sm121", False)
+    has_sm10x_or_newer = has_sm100 or has_sm103 or has_sm110 or has_sm120 or has_sm121
 
     jit_specs += list(
         gen_attention(
@@ -562,8 +565,9 @@ def gen_all_modules(
         )
 
         jit_specs.append(gen_comm_alltoall_module())
-        if has_sm100:
+        if has_sm100 or has_sm103 or has_sm120 or has_sm121:
             jit_specs.append(gen_trtllm_comm_module())
+        if has_sm100:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
             jit_specs.append(gen_moe_alltoall_module())
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
@@ -659,7 +663,7 @@ def gen_all_modules(
         _ssu_num_accepted_dtypes = [torch.int32, torch.int64]
         # Default SSU MTP-simple module requires sm_80+ (uses cp.async).  If
         # the AOT build target has no Ampere-or-newer arch, skip it silently.
-        if has_sm80 or has_sm90 or has_sm100:
+        if has_sm80 or has_sm90 or has_sm10x_or_newer:
             for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
                 _ssu_dtype_combos,
                 _ssu_dims,
@@ -691,6 +695,21 @@ def gen_all_modules(
                     )
                 )
             jit_specs.append(gen_trtllm_utils_module())
+        if has_sm10x_or_newer:
+            for dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype in product(
+                _ssu_dtype_combos,
+                _ssu_dims,
+                _ssu_dstates,
+                _ssu_ntokens,
+                _ssu_cu_seqlens_dtypes,
+                _ssu_num_accepted_dtypes,
+            ):
+                jit_specs.append(
+                    # same false positive as above
+                    gen_selective_state_update_sm100_module(  # type: ignore[call-arg]
+                        *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
+                    )
+                )
         if has_sm90:
             jit_specs.append(gen_gdn_prefill_sm90_module())
         # FP4 KV cache quantization/dequantization
@@ -873,7 +892,7 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
 def get_default_config():
     """Get default AOT configuration"""
     return {
-        "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
+        "fa2_head_dim": [(64, 64), (128, 128), (256, 256), (512, 256)],
         "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
         "f16_dtype": [torch.float16, torch.bfloat16],
         "f8_dtype": [torch.float8_e4m3fn],
