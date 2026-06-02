@@ -20,6 +20,7 @@ def test_gb10_release_workflow_builds_native_sm121a_jit_cache():
     assert workflow.count(
         "FLASHINFER_LOCAL_VERSION: ${{ needs.setup.outputs.local_version }}"
     ) == 3
+    assert 'FLASHINFER_CUBIN_EXCLUDE_TRTLLM_GEN_FMHA: "1"' in workflow
     assert 'FLASHINFER_CUDA_ARCH_LIST: "12.1a"' in workflow
     assert "manylinuxaarch64-builder:cuda" in workflow
     assert "flashinfer-jit-cache" in workflow
@@ -28,6 +29,13 @@ def test_gb10_release_workflow_builds_native_sm121a_jit_cache():
     assert "release-metadata.json" in workflow
     assert "--notes-file dist/release-notes.md" in workflow
     assert "gh release upload" in workflow
+
+
+def test_gb10_cubin_release_excludes_unsupported_trtllm_gen_fmha():
+    artifacts = read("flashinfer/artifacts.py")
+
+    assert "FLASHINFER_CUBIN_EXCLUDE_TRTLLM_GEN_FMHA" in artifacts
+    assert "cubin_dirs.insert(0, ArtifactPath.TRTLLM_GEN_FMHA)" in artifacts
 
 
 def test_broad_release_automation_is_opt_in_for_the_fork():

@@ -227,9 +227,11 @@ def _get_host_cpu_arch() -> str:
 def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
     base = FLASHINFER_CUBINS_REPOSITORY
     cpu_arch = _get_host_cpu_arch()
+    exclude_trtllm_gen_fmha = os.environ.get(
+        "FLASHINFER_CUBIN_EXCLUDE_TRTLLM_GEN_FMHA", ""
+    ) in ("1", "true", "TRUE", "yes", "YES")
 
     cubin_dirs = [
-        ArtifactPath.TRTLLM_GEN_FMHA,
         ArtifactPath.TRTLLM_GEN_BMM,
         ArtifactPath.TRTLLM_GEN_GEMM,
         ArtifactPath.DEEPGEMM,
@@ -239,17 +241,21 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
             for arch in ArtifactPath.DSL_FMHA_ARCHS
         ),
     ]
+    if not exclude_trtllm_gen_fmha:
+        cubin_dirs.insert(0, ArtifactPath.TRTLLM_GEN_FMHA)
 
     # Get checksums of all files
     checksums = get_checksums(cubin_dirs)
 
     # The meta info header files first.
-    yield (
-        safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h")
-        ],
-    )
+    if not exclude_trtllm_gen_fmha:
+        fmha_meta_info = safe_urljoin(
+            ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h"
+        )
+        yield (
+            fmha_meta_info,
+            checksums[fmha_meta_info],
+        )
     yield (
         safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h"),
         checksums[

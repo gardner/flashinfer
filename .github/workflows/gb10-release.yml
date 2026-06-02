@@ -75,6 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FLASHINFER_LOCAL_VERSION: ${{ needs.setup.outputs.local_version }}
+      FLASHINFER_CUBIN_EXCLUDE_TRTLLM_GEN_FMHA: "1"
     steps:
       - uses: actions/checkout@v4
         with:
