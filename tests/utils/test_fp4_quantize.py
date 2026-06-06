@@ -617,10 +617,20 @@ NVFP4_SHAPES = [
     # Large K (column loop path in swizzled kernel)
     (128, 16384),
 ]
+
+# Trace-backed vLLM / model-shape groups from tests/trace/example.py and the
+# target GB10 model matrix. Keep this list small and representative so we cover
+# the common wide activations without exploding the full NVFP4 matrix.
+NVFP4_VLLM_SHAPES = [
+    (128, 4096),
+    (128, 5120),
+    (128, 7168),
+]
 NVFP4_BACKENDS = ["cuda", "cute-dsl"]
 NVFP4_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_8x4, SfLayout.layout_linear]
 # Roundtrip test only for layouts the dequantizer supports (128x4 and linear)
 NVFP4_ROUNDTRIP_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_linear]
+NVFP4_VLLM_SF_LAYOUTS = [SfLayout.layout_128x4, SfLayout.layout_linear]
 
 
 @dataclass(frozen=True)
@@ -1237,6 +1247,87 @@ def test_nvfp4_quantize_backend_parity(
             atol=0,
             msg=error_msg,
         )
+
+
+@pytest.mark.parametrize("shape", NVFP4_VLLM_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_VLLM_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_vllm_shape_groups(
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+) -> None:
+    """Exercise trace-backed vLLM model shapes on NVFP4 quantization."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for NVFP4 quantization tests")
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x = torch.randn((m, n), dtype=torch.bfloat16)
+
+    tensor_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    quant_cuda, scale_cuda = nvfp4_quantize(
+        x, global_scale, sfLayout=sf_layout, backend="cuda"
+    )
+    quant_cute, scale_cute = nvfp4_quantize(
+        x, global_scale, sfLayout=sf_layout, backend="cute-dsl"
+    )
+
+    assert quant_cuda.shape == quant_cute.shape, (
+        f"Quantized output shape mismatch for {sf_layout.name}"
+    )
+    assert scale_cuda.shape == scale_cute.shape, (
+        f"Scale output shape mismatch for {sf_layout.name}"
+    )
+
+    quant_match_pct = (quant_cuda == quant_cute).float().mean().item() * 100
+    scale_match_pct = (scale_cuda == scale_cute).float().mean().item() * 100
+    assert quant_match_pct > 95.0, (
+        f"Quantized values should match >95%, got {quant_match_pct:.1f}% "
+        f"(shape={shape}, layout={sf_layout.name})"
+    )
+    assert scale_match_pct > 95.0, (
+        f"Scale factors should match >95%, got {scale_match_pct:.1f}% "
+        f"(shape={shape}, layout={sf_layout.name})"
+    )
+
+    is_swizzled = sf_layout != SfLayout.layout_linear
+    dq_cuda = e2m1_and_ufp8sf_scale_to_float(
+        quant_cuda,
+        scale_cuda,
+        1 / global_scale,
+        sf_vec_size=16,
+        ufp8_type=1,
+        is_sf_swizzled_layout=is_swizzled,
+    ).to(torch.float32)
+    dq_cute = e2m1_and_ufp8sf_scale_to_float(
+        quant_cute,
+        scale_cute,
+        1 / global_scale,
+        sf_vec_size=16,
+        ufp8_type=1,
+        is_sf_swizzled_layout=is_swizzled,
+    ).to(torch.float32)
+
+    torch.testing.assert_close(
+        dq_cuda,
+        dq_cute,
+        rtol=0,
+        atol=0,
+        msg=(
+            f"CUDA and CuTe-DSL backends differ after dequantization for "
+            f"shape={shape}, layout={sf_layout.name}"
+        ),
+    )
 
 
 NVFP4_FP8_SHAPES = [(128, 64), (256, 128), (512, 256), (128, 1024)]
