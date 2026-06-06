@@ -167,6 +167,8 @@ def test_mm_fp4_b12x_sm12x_m_sweep_no_m_dependent_zero_outputs(backend):
         (16, 4096, 2048),
         (64, 2048, 4096),
         (128, 7168, 2048),
+        (128, 2048, 7168),
+        (128, 1536, 7168),
     ],
 )
 def test_mm_fp4_b12x_sm12x_model_shape_smoke(backend, m, n, k):
