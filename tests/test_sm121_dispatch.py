@@ -272,6 +272,75 @@ def test_gdn_prefill_sm121_dispatches_to_sm12x_kernel(monkeypatch):
     assert result == (output, output_state)
     assert len(calls) == 1
     assert calls[0]["q"] is q
+    assert calls[0]["k"] is k
     assert calls[0]["output"] is output
     assert calls[0]["output_state"] is output_state
     assert calls[0]["cu_seqlens_dtype"] == torch.int32
+
+
+def test_gdn_prefill_sm121_l2norms_q_and_k_before_dispatch(monkeypatch):
+    import flashinfer.gdn_prefill as gdn_prefill
+
+    monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
+    monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda device: (12, 1))
+    monkeypatch.setattr(gdn_prefill, "_has_sm12x_prefill", True)
+
+    calls = []
+
+    def fake_sm12x_kernel(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        output,
+        cu_seqlens,
+        initial_state,
+        output_state,
+        scale,
+        checkpoint_every_n_tokens=0,
+        cu_checkpoints=None,
+        output_checkpoints=None,
+    ):
+        calls.append({"q": q, "k": k, "output": output, "output_state": output_state})
+
+    monkeypatch.setattr(gdn_prefill, "chunk_gated_delta_rule_sm12x", fake_sm12x_kernel)
+
+    q, k, v, g, beta, cu_seqlens, output, output_state = _make_gdn_prefill_tensors()
+    q.copy_(torch.randn_like(q) + 1.0)
+    k.copy_(torch.randn_like(k) + 1.0)
+    original_q = q.clone()
+    original_k = k.clone()
+
+    result = gdn_prefill.chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        output=output,
+        output_state=output_state,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    assert result == (output, output_state)
+    assert len(calls) == 1
+    assert calls[0]["q"] is not q
+    assert calls[0]["k"] is not k
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(calls[0]["q"].float(), dim=-1),
+        torch.ones_like(calls[0]["q"].float().sum(dim=-1)),
+        atol=5e-3,
+        rtol=5e-3,
+    )
+    torch.testing.assert_close(
+        torch.linalg.vector_norm(calls[0]["k"].float(), dim=-1),
+        torch.ones_like(calls[0]["k"].float().sum(dim=-1)),
+        atol=5e-3,
+        rtol=5e-3,
+    )
+    torch.testing.assert_close(q, original_q)
+    torch.testing.assert_close(k, original_k)

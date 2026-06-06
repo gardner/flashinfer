@@ -19,6 +19,7 @@ import math
 from types import SimpleNamespace
 from typing import Optional, Union, Tuple
 import torch
+import torch.nn.functional as F
 
 from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
@@ -193,6 +194,8 @@ def chunk_gated_delta_rule(
         - SM100 path requires head_size == 128.
         - SM100 path requires ``nvidia-cutlass-dsl[cu13]>=4.4.2``
           (install via ``pip install flashinfer-python[cu13]``).
+        - ``use_qk_l2norm_in_kernel=True`` normalizes Q and K before dispatch
+          on the supported GPU paths.
     """
     if checkpoint_every_n_tokens < 0:
         raise ValueError(
@@ -300,6 +303,10 @@ def chunk_gated_delta_rule(
         assert head_size == 128, (
             f"Blackwell GDN prefill requires head_size=128, got {head_size}"
         )
+
+        if use_qk_l2norm_in_kernel:
+            q = F.normalize(q, p=2.0, dim=-1).contiguous()
+            k = F.normalize(k, p=2.0, dim=-1).contiguous()
 
         # Allocate output_state only when needed
         if not output_final_state:
