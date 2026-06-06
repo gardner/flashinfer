@@ -211,12 +211,6 @@ def _reference_decode_gqa_nhd(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12,
     reason="SM12x high-GQA decode regression requires an SM120/SM121 GPU",
 )
-@pytest.mark.skip(
-    reason=(
-        "SM12x high-GQA tensor-core decode currently hangs on GB10; keep this "
-        "as a manual blocker until the decode path is fixed."
-    )
-)
 @pytest.mark.parametrize(
     "num_kv_heads,group_size,head_dim",
     [
