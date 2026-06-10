@@ -1121,6 +1121,108 @@ class TestB12xFunctional:
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
         )
 
+    @pytest.mark.parametrize("num_tokens", [1, 128, 512])
+    def test_qwen3_moe_shape_accuracy(self, num_tokens: int):
+        """Native b12x NVFP4 (W4A4) MoE accuracy at a real GB10 MoE
+        target-model shape: Qwen3.6-35B-A3B-NVFP4 (hidden_size=2048,
+        moe_intermediate_size=512, num_experts=256, top_k=8), at decode (1),
+        small-prefill (128), and large-prefill (512) token counts. This is
+        the native MoE acceleration path the single-Spark FlashInfer route
+        uses for a real NVFP4 MoE model."""
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 2048, 512
+        num_experts, top_k = 256, 8
+        num_local_experts = num_experts
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            top_k=top_k,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert result.dtype == torch.bfloat16
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_local_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+        )
+
+    def test_nemotron3_nano_moe_intermediate_not_128_aligned_rejected(self):
+        """Coverage boundary: the native b12x NVFP4 (W4A4) MoE kernel requires
+        moe_intermediate_size % 128 == 0 for the gate/up tile split. The real
+        GB10 model NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 has
+        moe_intermediate_size=1856 (= 14.5*128, NOT 128-aligned), so its MoE
+        layers cannot use this native W4A4 path. Assert it fails fast with a
+        clear error rather than silently producing wrong output. (The W4A16
+        path has a 64-tiler for non-128-aligned intermediates; extending W4A4
+        similarly is a future enhancement to widen native MoE coverage.)"""
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 2688, 1856
+        num_experts, top_k = 128, 6
+        tensors = create_moe_tensors(
+            num_tokens=8,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        with pytest.raises(ValueError, match="must be a multiple of 128"):
+            b12x_fused_moe(
+                x=tensors["x_bf16"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_experts,
+            )
+
     def test_activation_precision_api_validation(self):
         """W4A4 requires fc2_input_scale; W4A16 tolerates it."""
         from flashinfer import b12x_fused_moe
