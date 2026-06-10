@@ -106,10 +106,14 @@ def test_sinqle_prefill_with_paged_kv_cache(
 
 @pytest.mark.parametrize("kv_len", [128, 256])
 @pytest.mark.parametrize("qo_len", [64, 128])
-@pytest.mark.parametrize("num_kv_heads", [1])
-@pytest.mark.parametrize("num_qo_heads", [1])
+# num_kv_heads/num_qo_heads cover MHA (1:1) plus GQA ratios; invalid combos
+# (num_qo_heads not a multiple of num_kv_heads) are skipped below. 8:2 mirrors
+# the GB10 target-model 32:8 Llama-3.1/Qwen3 GQA ratio.
+@pytest.mark.parametrize("num_kv_heads", [1, 2])
+@pytest.mark.parametrize("num_qo_heads", [1, 4, 8])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("causal", [False])
+# causal=True is the real prefill path vLLM uses for FP4 KV.
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 def test_single_prefill_with_kv_cache_nvfp4(
     kv_len,
@@ -130,6 +134,8 @@ def test_single_prefill_with_kv_cache_nvfp4(
     """
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
+    if num_qo_heads % num_kv_heads != 0:
+        pytest.skip("num_qo_heads must be a multiple of num_kv_heads")
 
     torch.manual_seed(42)
 
