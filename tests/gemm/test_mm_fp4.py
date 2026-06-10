@@ -189,6 +189,38 @@ def test_mm_fp4_b12x_sm12x_model_shape_smoke(backend, m, n, k):
 
 
 @pytest.mark.parametrize("backend", ["b12x", "auto"])
+@pytest.mark.parametrize("m", [1, 128, 512])
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        # Llama-3.1-8B-NVFP4 linear-layer GEMM shapes (the GB10 target model):
+        # every projection the native NVFP4 path must serve.
+        (6144, 4096),  # qkv_proj  (32+8+8 heads * 128 <- hidden 4096)
+        (4096, 4096),  # o_proj
+        (28672, 4096),  # gate_up_proj (2 * 14336 <- hidden 4096)
+        (4096, 14336),  # down_proj  (hidden <- intermediate 14336)
+        (128256, 4096),  # lm_head / vocab projection
+    ],
+)
+def test_mm_fp4_b12x_sm12x_llama31_8b_projection_shapes(backend, m, n, k):
+    """Native NVFP4 dense GEMM over every Llama-3.1-8B projection shape at
+    decode (m=1), small-prefill (m=128), and large-prefill (m=512) sizes."""
+    _skip_unless_sm12x_cuda13()
+
+    _test_mm_fp4(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        backend,
+        True,
+        False,
+        "nvfp4",
+    )
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("backend", ["b12x", "auto"])
 def test_mm_fp4_b12x_sm12x_cuda_graph_replay(backend):
     _skip_unless_sm12x_cuda13()
 
