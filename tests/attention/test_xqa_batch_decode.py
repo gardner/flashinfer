@@ -589,6 +589,10 @@ def test_xqa_batch_decode(
         (4, 4, 64, 4, 2),
         (1, 1, 64, 2, 4),
         (1, 1, 64, 2, 8),
+        # GB10 vLLM target-model GQA decode shapes (head_dim=128 cases below):
+        # Llama-3.1-8B / Qwen3-style 32 q : 8 kv heads.
+        (4, 1, 64, 8, 4),
+        (1, 1, 64, 8, 4),
     ],
 )
 @pytest.mark.parametrize("window_left", [-1])
@@ -599,6 +603,10 @@ def test_xqa_batch_decode(
         ("bf16", "nvfp4", "bf16"),
     ],
 )
+# head_dim=256 keeps the original coverage; head_dim=128 is the value vLLM's
+# GB10 target models (Llama-3.1, Qwen3 GQA) actually request, and is the
+# kernel-level evidence that gates enabling nvfp4_kv_cache_runtime in vLLM.
+@pytest.mark.parametrize("head_dim", [256, 128])
 @pytest.mark.parametrize("enable_pdl", [False])
 @pytest.mark.parametrize("enable_sink", [False])
 @pytest.mark.parametrize("max_in_kv_len", [110])
@@ -609,6 +617,7 @@ def test_xqa_batch_decode_nvfp4_kv(
     page_size,
     num_kv_heads,
     head_grp_size,
+    head_dim,
     window_left,
     q_dtype,
     o_dtype,
@@ -625,7 +634,6 @@ def test_xqa_batch_decode_nvfp4_kv(
 
     # Set up test parameters
     torch.manual_seed(0)
-    head_dim = 256
 
     # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
