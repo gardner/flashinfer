@@ -1249,6 +1249,73 @@ class TestB12xFunctional:
             f"(atol={atol:.4f}, tokens={num_tokens})"
         )
 
+    @pytest.mark.parametrize("num_tokens", [1, 128, 512])
+    def test_nemotron3_nano_moe_shape_w4a16_accuracy(self, num_tokens: int):
+        """Native b12x W4A16 NVFP4 MoE accuracy at the REAL shape of
+        nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 (hidden_size=2688,
+        moe_intermediate_size=1856, num_experts=128, top_k=6). 1856 = 29*64 is
+        64-aligned but NOT 128-aligned, so the native W4A4 kernel rejects it
+        (test_nemotron3_nano_moe_intermediate_not_128_aligned_rejected) and the
+        abandoned 64-tile W4A4 spike was not viable on the SM120 NVFP4 MMA. The
+        W4A16 path's 64-tiler DOES handle non-128-aligned intermediates, so
+        serving this checkpoint's NVFP4 weights weight-only (FP4 weights x BF16
+        activations) is the GB10 native MoE route for this model. Covers decode
+        (1), small-prefill (128), and large-prefill (512)."""
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 2688, 1856
+        num_experts, top_k = 128, 6
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            seed=2026,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            quant_mode="w4a16",
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert result.dtype == torch.bfloat16
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"Nemotron-3-Nano W4A16: {percent_within * 100:.2f}% within "
+            f"tolerance (atol={atol:.4f}, tokens={num_tokens})"
+        )
+
     def test_nemotron3_nano_moe_intermediate_not_128_aligned_rejected(self):
         """Coverage boundary: the native b12x NVFP4 (W4A4) MoE kernel requires
         moe_intermediate_size % 128 == 0 for the gate/up tile split. The real
